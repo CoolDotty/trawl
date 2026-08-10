@@ -71,6 +71,14 @@ export async function waitForAwsWafResolution(
         const remaining = deadline - Date.now()
         if (remaining <= 0) break
         captchaSolved = await solveCaptcha(page, remaining, options.solverOptions)
+        // The solver owns its bounded retry budget. Once it returns false, keep
+        // only an immediate token check for a race with AWS's voucher exchange;
+        // do not let the request idle until the caller's full maxTimeout expires.
+        if (!captchaSolved) {
+          const token = await getAwsWafToken(page, targetHost)
+          if (!token || token === initialToken) return { status: "timeout", captchaSolved: false }
+          captchaSolved = true
+        }
         continue
       }
 

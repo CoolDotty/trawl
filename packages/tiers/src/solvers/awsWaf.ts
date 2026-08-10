@@ -9,7 +9,10 @@
 
 import type { Locator, Page } from "patchright"
 import { hasAwsWafCaptcha, hasAwsWafInterstitial } from "../utils/detect"
+import { extractAwsWafAudioAnswer } from "./awsWafAudio"
 import { transcribeAudio } from "./stt"
+
+export { extractAwsWafAudioAnswer } from "./awsWafAudio"
 
 const START_SELECTORS = [
   "#captcha-container #amzn-captcha-verify-button",
@@ -275,38 +278,4 @@ function domainMatches(hostname: string, cookieDomain: string): boolean {
   if (!hostname) return false
   const normalized = cookieDomain.replace(/^\./, "")
   return hostname === normalized || hostname.endsWith(`.${normalized}`)
-}
-
-// AWS asks for either of two words, but its audio track also contains the
-// spoken instruction and decoy speech. Whisper normally punctuates the
-// instruction; Google's zero-key recognizer often does not, so recognize both
-// forms and submit only the first answer word after the instruction.
-export function extractAwsWafAudioAnswer(transcript: string | undefined): string | undefined {
-  if (!transcript) return
-
-  const normalized = transcript.toLowerCase().trim().replace(/\s+/g, " ")
-  if (!normalized) return
-
-  const instruction =
-    /(?:type|enter|write|repeat)?\s*(?:any\s+)?one\s+of\s+the\s+two\s+following\s+words?\s+spoken\s+by\s+me[\s.,:;!?-]*/i
-  const marker = instruction.exec(normalized)
-  const spokenByMe = normalized.lastIndexOf("spoken by me")
-  const candidates = marker
-    ? normalized.slice((marker.index ?? 0) + marker[0].length)
-    : spokenByMe >= 0
-      ? normalized.slice(spokenByMe + "spoken by me".length)
-      : ""
-
-  if (candidates) {
-    const words = candidates.match(/[a-z0-9]+(?:['’-][a-z0-9]+)*/g) ?? []
-    const answer = words.find((word) => !["a", "an", "the"].includes(word))
-    if (answer) return answer
-  }
-
-  // An instruction-only recognition is not an answer. Returning its final
-  // word (usually "me") submits a guaranteed failure instead of refreshing.
-  if (marker || spokenByMe >= 0) return
-
-  const words = normalized.match(/[a-z0-9]+(?:['’-][a-z0-9]+)*/g) ?? []
-  return words.at(-1)
 }
