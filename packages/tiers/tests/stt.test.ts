@@ -1,5 +1,12 @@
 import { describe, expect, test } from "bun:test"
-import { audioFilename, googleSampleRates, inferAudioContentType, selectGoogleTranscript } from "../src/solvers/stt"
+import {
+  audioFilename,
+  googleFfmpegArgs,
+  googleSampleRates,
+  inferAudioContentType,
+  parseGoogleTranscriptAlternatives,
+  selectGoogleTranscript,
+} from "../src/solvers/stt"
 
 describe("audio CAPTCHA speech-to-text", () => {
   test("preserves AWS AAC MIME and filename information from a data URL", () => {
@@ -19,6 +26,41 @@ describe("audio CAPTCHA speech-to-text", () => {
     expect(googleSampleRates("audio/mpeg", "generic")).toEqual([8_000, 16_000])
   })
 
+  test("converts each pass to explicit mono 16-bit FLAC without reading stdin", () => {
+    expect(googleFfmpegArgs("input.aac", "output.flac", 16_000)).toEqual([
+      "-nostdin",
+      "-threads",
+      "0",
+      "-i",
+      "input.aac",
+      "-map",
+      "0:a:0",
+      "-vn",
+      "-ar",
+      "16000",
+      "-ac",
+      "1",
+      "-sample_fmt",
+      "s16",
+      "-c:a",
+      "flac",
+      "output.flac",
+      "-y",
+      "-loglevel",
+      "error",
+    ])
+  })
+
+  test("parses all Google JSON-lines alternatives in final-result-first order", () => {
+    const alternatives = parseGoogleTranscriptAlternatives(
+      [
+        JSON.stringify({ result: [{ alternative: [{ transcript: "first" }] }] }),
+        JSON.stringify({ result: [{ alternative: [{ transcript: "final" }, { transcript: "final alt" }] }] }),
+      ].join("\n"),
+    )
+    expect(alternatives.map(({ transcript }) => transcript)).toEqual(["final", "final alt", "first"])
+  })
+
   test("selects the AWS-aware alternative instead of Google's misleading top result", () => {
     const transcript = selectGoogleTranscript(
       [
@@ -35,6 +77,31 @@ describe("audio CAPTCHA speech-to-text", () => {
       "aws-waf",
     )
     expect(transcript).toBe("type one of the two following words spoken by me church and again")
+  })
+
+  test("prefers an answer repeated across low-confidence rate alternatives", () => {
+    expect(
+      selectGoogleTranscript(
+        [
+          { transcript: "type one of the two following words spoken by me church and again" },
+          { transcript: "type one of the two following words spoken by me approach and again" },
+          { transcript: "type one of the two following words spoken by me church and again" },
+        ],
+        "aws-waf",
+      ),
+    ).toBe("type one of the two following words spoken by me church and again")
+  })
+
+  test("does not let a high-confidence instruction fragment outrank an answer-marked transcript", () => {
+    expect(
+      selectGoogleTranscript(
+        [
+          { transcript: "type one of the two following words spoken by me church and again", confidence: 0.65 },
+          { transcript: "because it would be nice", confidence: 0.99 },
+        ],
+        "aws-waf",
+      ),
+    ).toBe("type one of the two following words spoken by me church and again")
   })
 
   test("preserves the first Google alternative for non-AWS challenges", () => {

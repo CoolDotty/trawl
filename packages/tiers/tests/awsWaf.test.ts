@@ -134,6 +134,7 @@ describe("AWS WAF CAPTCHA browser flow", () => {
         "because it would be deep one of the two following words spoken by me church that is company nature",
       ),
     ).toBe("church")
+    expect(extractAwsWafAudioAnswer("one of the two following words spoken by me and church and again")).toBe("church")
     expect(extractAwsWafAudioAnswer("type one of the two following words spoken by me a science from use")).toBe(
       "science",
     )
@@ -211,6 +212,28 @@ describe("AWS WAF CAPTCHA browser flow", () => {
 
     expect(result).toEqual({ status: "ok", captchaSolved: true })
     expect(calls).toBe(1)
+  })
+
+  test("full-page waiter returns when the bounded solver exhausts retries", async () => {
+    const state: WidgetState = { stage: "visual", audioToggleClicked: false, submitted: false }
+    const page = mockAwsPage(state)
+    let calls = 0
+    let sleeps = 0
+
+    const result = await waitForAwsWafResolution(page, 60_000, page.url(), () => ({}), {
+      sleep: async () => {
+        sleeps++
+        if (sleeps > 1) throw new Error("waiter should not keep polling after solver failure")
+      },
+      solveCaptcha: async () => {
+        calls++
+        return false
+      },
+    })
+
+    expect(result).toEqual({ status: "timeout", captchaSolved: false })
+    expect(calls).toBe(1)
+    expect(sleeps).toBe(1)
   })
 
   test("zero timeout returns without touching the page", async () => {

@@ -11,6 +11,7 @@
 
 import { randomUUID } from "node:crypto"
 import { $ } from "bun"
+import { extractAwsWafAudioCandidates } from "./awsWafAudio"
 
 const STT_URL = process.env.STT_URL ?? ""
 const STT_KEY = process.env.STT_API_KEY ?? ""
@@ -106,7 +107,7 @@ async function transcribeGoogle(
     const awsAlternatives: GoogleTranscriptAlternative[] = []
     for (const rate of googleSampleRates(audio.contentType, challenge)) {
       const flac = rate === 16_000 ? flac16 : flac8
-      const ff = await $`${FFMPEG} -i ${input} -ar ${rate} -ac 1 -c:a flac ${flac} -y -loglevel error`.nothrow()
+      const ff = await $`${FFMPEG} ${googleFfmpegArgs(input, flac, rate)}`.nothrow()
       if (ff.exitCode !== 0) {
         console.log(`[stt] ffmpeg ${rate}Hz error:`, ff.stderr.toString().trim().slice(0, 120))
         continue
@@ -129,14 +130,7 @@ async function transcribeGoogle(
       const raw = await sttRes.text()
       console.log("[stt] raw response:", raw.slice(0, 300))
 
-      const alternatives: GoogleTranscriptAlternative[] = []
-      for (const line of raw.split("\n").reverse()) {
-        if (!line.startsWith("{")) continue
-        try {
-          const result = JSON.parse(line) as { result?: Array<{ alternative?: GoogleTranscriptAlternative[] }> }
-          for (const item of result.result ?? []) alternatives.push(...(item.alternative ?? []))
-        } catch {}
-      }
+      const alternatives = parseGoogleTranscriptAlternatives(raw)
 
       if (challenge === "aws-waf") {
         awsAlternatives.push(...alternatives)
@@ -210,6 +204,43 @@ export function googleSampleRates(contentType: string, challenge: AudioChallenge
   return challenge === "aws-waf" || /aac|mp4/i.test(contentType) ? [16_000, 8_000] : [8_000, 16_000]
 }
 
+export function googleFfmpegArgs(input: string, output: string, rate: number): readonly string[] {
+  return [
+    "-nostdin",
+    "-threads",
+    "0",
+    "-i",
+    input,
+    "-map",
+    "0:a:0",
+    "-vn",
+    "-ar",
+    String(rate),
+    "-ac",
+    "1",
+    "-sample_fmt",
+    "s16",
+    "-c:a",
+    "flac",
+    output,
+    "-y",
+    "-loglevel",
+    "error",
+  ]
+}
+
+export function parseGoogleTranscriptAlternatives(raw: string): GoogleTranscriptAlternative[] {
+  const alternatives: GoogleTranscriptAlternative[] = []
+  for (const line of raw.split("\n").reverse()) {
+    if (!line.startsWith("{")) continue
+    try {
+      const result = JSON.parse(line) as { result?: Array<{ alternative?: GoogleTranscriptAlternative[] }> }
+      for (const item of result.result ?? []) alternatives.push(...(item.alternative ?? []))
+    } catch {}
+  }
+  return alternatives
+}
+
 export function selectGoogleTranscript(
   alternatives: readonly GoogleTranscriptAlternative[],
   challenge: AudioChallengeKind,
@@ -237,10 +268,38 @@ export function selectGoogleTranscript(
       (/spoken by me/i.test(text) ? 100 : 0) +
       (/following words?/i.test(text) ? 50 : 0) +
       (/one of (?:the )?two/i.test(text) ? 25 : 0) -
+      Math.max(answerWords - 2, 0) * 5 -
       (spokenByMe && !answerTail ? 200 : 0) -
       (/\b(?:do not|don't)\s+(?:type|enter|write|repeat)\b/i.test(text) ? 250 : 0)
     )
   }
+
+  // Google can return a plausible but wrong top alternative for this noisy,
+  // instruction-plus-two-words recording. Prefer an answer repeated across
+  // alternatives/rate passes, then use the existing instruction-aware score
+  // to select the best transcript within that answer group.
+  const groups = new Map<string, { totalWeight: number }>()
+  for (const candidate of candidates) {
+    const answer = extractAwsWafAudioCandidates(candidate.transcript)[0]
+    if (!answer) continue
+    // Keep the instruction structure meaningful: a high-confidence fragment
+    // such as "because it would be nice" is weaker evidence than a lower-
+    // confidence transcript that actually contains AWS's answer marker.
+    const weight = Math.max(0.1, score(candidate) / 100)
+    const current = groups.get(answer)
+    if (current) current.totalWeight += weight
+    else groups.set(answer, { totalWeight: weight })
+  }
+
+  const winningAnswer = Array.from(groups.entries()).toSorted(
+    ([, left], [, right]) => right.totalWeight - left.totalWeight,
+  )[0]?.[0]
+  if (winningAnswer) {
+    return candidates
+      .filter((candidate) => extractAwsWafAudioCandidates(candidate.transcript)[0] === winningAnswer)
+      .toSorted((left, right) => score(right) - score(left))[0]?.transcript
+  }
+
   return candidates.toSorted((left, right) => score(right) - score(left))[0]?.transcript
 }
 
